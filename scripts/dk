@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# dk — lease Nordic DKs (by J-Link serial) across parallel workspaces/agents.
+#
+# Problem: more workspaces (r/0, r/1, r/2) than DKs (2). Tools that auto-grab
+# "the first J-Link" collide when agents run in parallel. This hands each
+# workspace an *exclusive* DK via an atomic, workspace-bound lease, so a flash
+# always targets a known serial and two sessions never touch the same board.
+#
+# State:  $DK_STATE (default ~/.local/share/nordic-dk)
+#   pool            one J-Link serial per line (the DKs available for leasing)
+#   leases/<serial> owner workspace + timestamp + label (presence == leased)
+# A lease is keyed by DK serial and owned by a *workspace* (the west topdir),
+# not a process — so it persists when an agent exits and is released explicitly.
+set -euo pipefail
+
+STATE="${DK_STATE:-$HOME/.local/share/nordic-dk}"
+POOL="$STATE/pool"
+LEASES="$STATE/leases"
+mkdir -p "$LEASES"
+
+# Seed the pool once with the two known DKs if it doesn't exist yet.
+if [[ ! -f "$POOL" ]]; then
+  printf '%s\n' 1051875858 1051890455 > "$POOL"
+fi
+
+die() { echo "dk: $*" >&2; exit 1; }
+
+# Workspace identity = nearest enclosing west topdir (dir containing .west/),
+# else cwd. This is what a lease is bound to.
+ws_root() {
+  local d="$PWD"
+  while [[ "$d" != "/" ]]; do
+    [[ -d "$d/.west" ]] && { echo "$d"; return; }
+    d=$(dirname "$d")
+  done
+  echo "$PWD"
+}
+
+pool_serials() { grep -vE '^\s*(#|$)' "$POOL" || true; }
+
+# Is a serial physically plugged in right now? (zero-padded by-id symlink)
+connected() {
+  local s; s=$(printf '%012d' "$1" 2>/dev/null || echo "$1")
+  ls /dev/serial/by-id/ 2>/dev/null | grep -qE "J-Link_0*${1}-" && return 0
+  ls /dev/serial/by-id/ 2>/dev/null | grep -qE "J-Link_${s}-"
+}
+
+lease_owner() { [[ -f "$LEASES/$1" ]] && head -n1 "$LEASES/$1" | cut -f1; }
+
+# serial currently leased by THIS workspace, if any
+held_by_ws() {
+  local ws; ws=$(ws_root) || return 1
+  shopt -s nullglob
+  local f
+  for f in "$LEASES"/*; do
+    [[ "$(head -n1 "$f" | cut -f1)" == "$ws" ]] && { basename "$f"; return 0; }
+  done
+  return 1
+}
+
+cmd_claim() { # [serial]
+  local want="${1:-}" ws held s
+  ws=$(ws_root)
+  if held=$(held_by_ws); then            # idempotent: already hold one
+    if [[ -n "$want" && "$want" != "$held" ]]; then
+      die "workspace $ws already holds $held (release it first)"
+    fi
+    echo "$held"; return 0
+  fi
+  for s in $(pool_serials); do
+    [[ -n "$want" && "$s" != "$want" ]] && continue
+    # atomic create-if-absent (noclobber) — the actual mutual-exclusion point
+    if (set -o noclobber; printf '%s\t%s\t%s\n' \
+          "$ws" "$(date -Is)" "${DK_AGENT:-${USER}@$(hostname -s)}" \
+          > "$LEASES/$s") 2>/dev/null; then
+      echo "$s" > "$ws/.dk"
+      echo "$s"; return 0
+    fi
+  done
+  [[ -n "$want" ]] && die "DK $want is not free (held by $(lease_owner "$want"))"
+  die "no free DK (all $(pool_serials | wc -l) leased) — see 'dk status'"
+}
+
+cmd_release() {
+  local ws held; ws=$(ws_root)
+  if held=$(held_by_ws); then
+    rm -f "$LEASES/$held" "$ws/.dk"
+    echo "released $held"
+  else
+    echo "no DK held by $ws"
+  fi
+}
+
+cmd_which() { held_by_ws || die "no DK leased for this workspace (run 'dk claim')"; }
+
+cmd_env() {
+  local s; s=$(held_by_ws) || die "no DK leased (run 'dk claim')"
+  echo "export NRF_DK_SERIAL=$s"
+}
+
+cmd_status() {
+  local s owner conn
+  printf '%-14s %-10s %-9s %s\n' SERIAL STATE PLUGGED OWNER
+  for s in $(pool_serials); do
+    if [[ -f "$LEASES/$s" ]]; then owner=$(head -n1 "$LEASES/$s"); else owner="-	-	free"; fi
+    conn=$(connected "$s" && echo yes || echo NO)
+    printf '%-14s %-10s %-9s %s\n' "$s" \
+      "$([[ -f "$LEASES/$s" ]] && echo leased || echo free)" "$conn" \
+      "$(echo "$owner" | cut -f1) $(echo "$owner" | cut -f3)"
+  done
+}
+
+case "${1:-status}" in
+  claim)   shift; cmd_claim "${1:-}";;
+  release) cmd_release;;
+  which)   cmd_which;;
+  env)     cmd_env;;
+  status)  cmd_status;;
+  pool)    pool_serials;;
+  *) cat >&2 <<EOF
+usage: dk <command>
+  claim [serial]  lease a free DK (or a specific one) for this workspace; prints serial
+  release         release this workspace's DK
+  which           print this workspace's leased serial
+  env             print 'export NRF_DK_SERIAL=<serial>' for eval
+  status          show pool, lease state, and which DKs are plugged in
+  pool            list configured DK serials
+Bind a workspace, then flash that exact board:
+  dk claim
+  west flash -d build_urot --dev-id "\$(dk which)"
+EOF
+    exit 2;;
+esac
