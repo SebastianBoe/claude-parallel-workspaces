@@ -1,133 +1,337 @@
-#!/usr/bin/env bash
-# dk — lease Nordic DKs (by J-Link serial) across parallel workspaces/agents.
-#
-# Problem: more workspaces (r/0, r/1, r/2) than DKs (2). Tools that auto-grab
-# "the first J-Link" collide when agents run in parallel. This hands each
-# workspace an *exclusive* DK via an atomic, workspace-bound lease, so a flash
-# always targets a known serial and two sessions never touch the same board.
-#
-# State:  $DK_STATE (default ~/.local/share/nordic-dk)
-#   pool            one J-Link serial per line (the DKs available for leasing)
-#   leases/<serial> owner workspace + timestamp + label (presence == leased)
-# A lease is keyed by DK serial and owned by a *workspace* (the west topdir),
-# not a process — so it persists when an agent exits and is released explicitly.
-set -euo pipefail
+#!/usr/bin/env python3
+"""dk — allocate connected Nordic DKs to owners (agents / personal debug).
 
-STATE="${DK_STATE:-$HOME/.local/share/nordic-dk}"
-POOL="$STATE/pool"
-LEASES="$STATE/leases"
-mkdir -p "$LEASES"
+Single source of truth is a TOML config (default ~/.config/nrf-dk/boards.toml)
+mapping each physical DK, by its J-Link serial number, to an owner string.
 
-# Seed the pool once with the two known DKs if it doesn't exist yet.
-if [[ ! -f "$POOL" ]]; then
-  printf '%s\n' 1051875858 1051890455 > "$POOL"
-fi
+Conventional owners:
+  debug         your own interactive debugging
+  agent:<name>  allocated to a specific coding agent
 
-die() { echo "dk: $*" >&2; exit 1; }
+Typical use in scripts / agents:
+  nrfutil device program --serial-number "$(dk resolve agent:007)" ...
+  west flash --dev-id "$(dk resolve debug)" ...
 
-# Workspace identity = nearest enclosing west topdir (dir containing .west/),
-# else cwd. This is what a lease is bound to.
-ws_root() {
-  local d="$PWD"
-  while [[ "$d" != "/" ]]; do
-    [[ -d "$d/.west" ]] && { echo "$d"; return; }
-    d=$(dirname "$d")
-  done
-  echo "$PWD"
-}
+Commands:
+  dk list                      show connected DKs and their allocation
+  dk resolve <owner>           print the J-Link serial for an owner (for scripts)
+  dk port <owner> <vcom>       print the serial port (e.g. /dev/ttyACM1) for an
+                               owner's vcom index (0 or 1) — robust to enumeration
+  dk who <serial|substr>       show which owner a serial is allocated to
+  dk allocate <serial> <owner> allocate a DK to an owner (serial may be a substring
+                               of a connected device; metadata is auto-filled)
+  dk free <serial|owner>       remove an allocation
+  dk path                      print the config file path
 
-pool_serials() { grep -vE '^\s*(#|$)' "$POOL" || true; }
+Env:
+  NRF_DK_CONFIG   override the config file path
+"""
 
-# Is a serial physically plugged in right now? (zero-padded by-id symlink)
-connected() {
-  local s; s=$(printf '%012d' "$1" 2>/dev/null || echo "$1")
-  ls /dev/serial/by-id/ 2>/dev/null | grep -qE "J-Link_0*${1}-" && return 0
-  ls /dev/serial/by-id/ 2>/dev/null | grep -qE "J-Link_${s}-"
-}
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
 
-lease_owner() { [[ -f "$LEASES/$1" ]] && head -n1 "$LEASES/$1" | cut -f1; }
 
-# serial currently leased by THIS workspace, if any
-held_by_ws() {
-  local ws; ws=$(ws_root) || return 1
-  shopt -s nullglob
-  local f
-  for f in "$LEASES"/*; do
-    [[ "$(head -n1 "$f" | cut -f1)" == "$ws" ]] && { basename "$f"; return 0; }
-  done
-  return 1
-}
+def config_path() -> Path:
+    env = os.environ.get("NRF_DK_CONFIG")
+    if env:
+        return Path(env).expanduser()
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "nrf-dk" / "boards.toml"
 
-cmd_claim() { # [serial]
-  local want="${1:-}" ws held s
-  ws=$(ws_root)
-  if held=$(held_by_ws); then            # idempotent: already hold one
-    if [[ -n "$want" && "$want" != "$held" ]]; then
-      die "workspace $ws already holds $held (release it first)"
-    fi
-    echo "$held"; return 0
-  fi
-  for s in $(pool_serials); do
-    [[ -n "$want" && "$s" != "$want" ]] && continue
-    # atomic create-if-absent (noclobber) — the actual mutual-exclusion point
-    if (set -o noclobber; printf '%s\t%s\t%s\n' \
-          "$ws" "$(date -Is)" "${DK_AGENT:-${USER}@$(hostname -s)}" \
-          > "$LEASES/$s") 2>/dev/null; then
-      echo "$s" > "$ws/.dk"
-      echo "$s"; return 0
-    fi
-  done
-  [[ -n "$want" ]] && die "DK $want is not free (held by $(lease_owner "$want"))"
-  die "no free DK (all $(pool_serials | wc -l) leased) — see 'dk status'"
-}
 
-cmd_release() {
-  local ws held; ws=$(ws_root)
-  if held=$(held_by_ws); then
-    rm -f "$LEASES/$held" "$ws/.dk"
-    echo "released $held"
-  else
-    echo "no DK held by $ws"
-  fi
-}
+def norm(serial: str) -> str:
+    """Normalize a serial for comparison: uppercase, strip leading zeros."""
+    return serial.strip().upper().lstrip("0")
 
-cmd_which() { held_by_ws || die "no DK leased for this workspace (run 'dk claim')"; }
 
-cmd_env() {
-  local s; s=$(held_by_ws) || die "no DK leased (run 'dk claim')"
-  echo "export NRF_DK_SERIAL=$s"
-}
+# ---------------------------------------------------------------------------
+# config load / save
+# ---------------------------------------------------------------------------
 
-cmd_status() {
-  local s owner conn
-  printf '%-14s %-10s %-9s %s\n' SERIAL STATE PLUGGED OWNER
-  for s in $(pool_serials); do
-    if [[ -f "$LEASES/$s" ]]; then owner=$(head -n1 "$LEASES/$s"); else owner="-	-	free"; fi
-    conn=$(connected "$s" && echo yes || echo NO)
-    printf '%-14s %-10s %-9s %s\n' "$s" \
-      "$([[ -f "$LEASES/$s" ]] && echo leased || echo free)" "$conn" \
-      "$(echo "$owner" | cut -f1) $(echo "$owner" | cut -f3)"
-  done
-}
+def load_config() -> list[dict]:
+    p = config_path()
+    if not p.exists():
+        return []
+    with p.open("rb") as f:
+        data = tomllib.load(f)
+    return data.get("board", [])
 
-case "${1:-status}" in
-  claim)   shift; cmd_claim "${1:-}";;
-  release) cmd_release;;
-  which)   cmd_which;;
-  env)     cmd_env;;
-  status)  cmd_status;;
-  pool)    pool_serials;;
-  *) cat >&2 <<EOF
-usage: dk <command>
-  claim [serial]  lease a free DK (or a specific one) for this workspace; prints serial
-  release         release this workspace's DK
-  which           print this workspace's leased serial
-  env             print 'export NRF_DK_SERIAL=<serial>' for eval
-  status          show pool, lease state, and which DKs are plugged in
-  pool            list configured DK serials
-Bind a workspace, then flash that exact board:
-  dk claim
-  west flash -d build_urot --dev-id "\$(dk which)"
-EOF
-    exit 2;;
-esac
+
+def _toml_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def save_config(boards: list[dict]) -> None:
+    p = config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# nRF DK allocation — managed by `dk`, but hand-editable.",
+        "# Each [[board]] maps a physical DK (by J-Link serial) to an owner.",
+        "# Conventional owners: debug, agent:<name>",
+        "",
+    ]
+    for b in boards:
+        lines.append("[[board]]")
+        # stable key order, serial + owner first
+        for key in ("serial", "owner", "product", "board_version", "note"):
+            if key in b and b[key] not in (None, ""):
+                lines.append(f'{key} = "{_toml_escape(str(b[key]))}"')
+        lines.append("")
+    p.write_text("\n".join(lines).rstrip() + "\n")
+
+
+# ---------------------------------------------------------------------------
+# connected devices via nrfutil
+# ---------------------------------------------------------------------------
+
+def list_connected() -> list[dict]:
+    exe = shutil.which("nrfutil")
+    if not exe:
+        return []
+    try:
+        out = subprocess.run(
+            [exe, "device", "list", "--json"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return []
+    devices = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        # the 'info' record carries the device list
+        if obj.get("type") == "info" and "devices" in obj.get("data", {}):
+            devices = obj["data"]["devices"]
+            break
+    result = []
+    for d in devices:
+        traits = d.get("traits", {})
+        result.append({
+            "serial": d.get("serialNumber", ""),
+            "product": (d.get("usb", {}).get("product")
+                        or ("J-Link" if traits.get("jlink") else "?")),
+            "board_version": d.get("devkit", {}).get("boardVersion", ""),
+            "family": d.get("devkit", {}).get("deviceFamily", ""),
+            "jlink": bool(traits.get("jlink")),
+            "ports": {p.get("vcom"): p.get("comName")
+                      for p in d.get("serialPorts", [])
+                      if p.get("vcom") is not None},
+        })
+    return result
+
+
+def find_connected(boards_connected: list[dict], query: str):
+    """Match a query (full or substring serial) against connected devices."""
+    nq = norm(query)
+    hits = [c for c in boards_connected if nq and nq in norm(c["serial"])]
+    return hits
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+def cmd_list(_args) -> int:
+    cfg = load_config()
+    connected = list_connected()
+    by_serial = {norm(b["serial"]): b for b in cfg}
+    seen = set()
+
+    dks = [c for c in connected if c["jlink"]]
+    others = [c for c in connected if not c["jlink"]]
+
+    print("Connected DKs:")
+    if not dks:
+        print("  (none)")
+    for c in dks:
+        key = norm(c["serial"])
+        seen.add(key)
+        alloc = by_serial.get(key)
+        owner = alloc["owner"] if alloc else "\033[33mUNALLOCATED\033[0m"
+        desc = c["board_version"] or c["product"]
+        print(f"  {c['serial']:<14} {owner:<24} {desc}")
+
+    # allocated but not currently connected
+    missing = [b for b in cfg if norm(b["serial"]) not in seen]
+    if missing:
+        print("\nAllocated but NOT connected:")
+        for b in missing:
+            print(f"  {b['serial']:<14} {b.get('owner',''):<24} "
+                  f"{b.get('board_version') or b.get('product','')}")
+
+    if others:
+        print("\nOther Nordic devices (not DKs, not allocatable):")
+        for c in others:
+            print(f"  {c['serial']:<14} {'':<24} {c['product']}")
+
+    print(f"\nConfig: {config_path()}")
+    return 0
+
+
+def cmd_resolve(args) -> int:
+    cfg = load_config()
+    hits = [b for b in cfg if b.get("owner") == args.owner]
+    if not hits:
+        print(f"dk: no DK allocated to owner '{args.owner}'", file=sys.stderr)
+        return 1
+    if len(hits) > 1:
+        print(f"dk: owner '{args.owner}' maps to {len(hits)} DKs: "
+              f"{', '.join(b['serial'] for b in hits)}", file=sys.stderr)
+        return 2
+    serial = hits[0]["serial"]
+    if args.require_connected or not args.quiet:
+        connected = {norm(c["serial"]) for c in list_connected()}
+        if norm(serial) not in connected:
+            msg = f"dk: warning: {serial} ({args.owner}) is not connected"
+            if args.require_connected:
+                print(f"dk: {serial} ({args.owner}) is not connected", file=sys.stderr)
+                return 3
+            print(msg, file=sys.stderr)
+    print(serial)
+    return 0
+
+
+def cmd_port(args) -> int:
+    cfg = load_config()
+    hits = [b for b in cfg if b.get("owner") == args.owner]
+    if not hits:
+        print(f"dk: no DK allocated to owner '{args.owner}'", file=sys.stderr)
+        return 1
+    if len(hits) > 1:
+        print(f"dk: owner '{args.owner}' maps to {len(hits)} DKs", file=sys.stderr)
+        return 2
+    serial = hits[0]["serial"]
+    dev = next((c for c in list_connected() if norm(c["serial"]) == norm(serial)), None)
+    if dev is None:
+        print(f"dk: {serial} ({args.owner}) is not connected", file=sys.stderr)
+        return 3
+    port = dev["ports"].get(args.vcom)
+    if port is None:
+        print(f"dk: {serial} has no vcom {args.vcom} "
+              f"(have: {sorted(dev['ports'])})", file=sys.stderr)
+        return 4
+    print(port)
+    return 0
+
+
+def cmd_who(args) -> int:
+    cfg = load_config()
+    nq = norm(args.serial)
+    hits = [b for b in cfg if nq in norm(b["serial"])]
+    if not hits:
+        print(f"dk: no allocation matching '{args.serial}'", file=sys.stderr)
+        return 1
+    for b in hits:
+        print(f"{b['serial']}\t{b.get('owner','')}")
+    return 0
+
+
+def cmd_allocate(args) -> int:
+    cfg = load_config()
+    connected = list_connected()
+
+    # let the user pass a substring of a connected serial
+    serial = args.serial
+    hits = find_connected(connected, serial)
+    meta = {}
+    if len(hits) == 1:
+        meta = hits[0]
+        serial = meta["serial"]
+    elif len(hits) > 1:
+        print(f"dk: '{args.serial}' matches {len(hits)} connected devices; "
+              "be more specific", file=sys.stderr)
+        return 2
+    # if no connected match, take the serial verbatim (offline allocation)
+
+    entry = next((b for b in cfg if norm(b["serial"]) == norm(serial)), None)
+    if entry is None:
+        entry = {"serial": serial}
+        cfg.append(entry)
+    entry["owner"] = args.owner
+    if meta:
+        entry["product"] = meta["product"]
+        entry["board_version"] = meta["board_version"]
+    if args.note is not None:
+        entry["note"] = args.note
+
+    save_config(cfg)
+    print(f"Allocated {serial} -> {args.owner}")
+    return 0
+
+
+def cmd_free(args) -> int:
+    cfg = load_config()
+    nq = norm(args.target)
+    before = len(cfg)
+    kept = [b for b in cfg
+            if not (nq in norm(b["serial"]) or b.get("owner") == args.target)]
+    if len(kept) == before:
+        print(f"dk: nothing matched '{args.target}'", file=sys.stderr)
+        return 1
+    save_config(kept)
+    print(f"Freed {before - len(kept)} allocation(s) matching '{args.target}'")
+    return 0
+
+
+def cmd_path(_args) -> int:
+    print(config_path())
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="dk", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd")
+
+    sub.add_parser("list", help="show connected DKs and their allocation")
+
+    p_res = sub.add_parser("resolve", help="print the J-Link serial for an owner")
+    p_res.add_argument("owner")
+    p_res.add_argument("-c", "--require-connected", action="store_true",
+                       help="fail if the allocated DK is not currently connected")
+    p_res.add_argument("-q", "--quiet", action="store_true",
+                       help="suppress the not-connected warning")
+
+    p_port = sub.add_parser("port", help="print the serial port for an owner's vcom")
+    p_port.add_argument("owner")
+    p_port.add_argument("vcom", type=int, help="vcom index (0 or 1)")
+
+    p_who = sub.add_parser("who", help="show which owner a serial belongs to")
+    p_who.add_argument("serial")
+
+    p_alloc = sub.add_parser("allocate", help="allocate a DK to an owner")
+    p_alloc.add_argument("serial", help="full or partial J-Link serial")
+    p_alloc.add_argument("owner")
+    p_alloc.add_argument("--note", default=None)
+
+    p_free = sub.add_parser("free", help="remove allocation(s) by serial or owner")
+    p_free.add_argument("target")
+
+    sub.add_parser("path", help="print the config file path")
+
+    args = parser.parse_args()
+    cmd = args.cmd or "list"
+    return {
+        "list": cmd_list,
+        "resolve": cmd_resolve,
+        "port": cmd_port,
+        "who": cmd_who,
+        "allocate": cmd_allocate,
+        "free": cmd_free,
+        "path": cmd_path,
+    }[cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

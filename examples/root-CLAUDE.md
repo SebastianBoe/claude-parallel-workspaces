@@ -17,12 +17,13 @@ under `~/r/`, so only put things that genuinely apply to all of them here. Proje
   results plainly (board serial + pass/fail); if HW verification was skipped, say so and treat
   the task as unfinished.
 
-## Lease hardware dynamically with `dk`
+## Boards are shared — resolve by owner, never grab "the first" device
 
-- **Claim a board only for the duration of the verification, then release it.** Do not hold a
-  lease across tasks or park one "just in case" — boards are shared across the sibling
-  workspaces.
-  - `dk status` / `dk which` — see what's available / what this workspace holds.
-  - `dk claim [<serial>]` — lease a board for the HW run.
-  - `dk release` — hand it back **as soon as the verification is done**, including on failure.
-- If no board is free, wait or ask — do not fabricate a HW result.
+- Allocation is static, not a per-task lease: check who owns a board before using it
+  (`~/.config/nrf-dk/boards.toml`, or `dk list`), and coordinate with the user if the one you need
+  is busy.
+- `dk list` — show connected devices and their current allocation.
+- `dk resolve <owner>` — get the exact serial allocated to your owner name; pass that **exact**
+  serial to every command that drives the hardware.
+- If no board allocated to you is connected, or the one you need is owned by someone else, wait or
+  ask — do not fabricate a HW result.

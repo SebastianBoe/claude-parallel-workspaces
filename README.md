@@ -38,13 +38,15 @@ as described below.
    anywhere underneath**, without needing to duplicate it into each workspace or each project's own
    `CLAUDE.md`. This is the right place for your standing, cross-project instructions — see
    [`examples/root-CLAUDE.md`](examples/root-CLAUDE.md) for a real one (hardware-verification
-   policy + the leasing rule below).
+   policy + the board-allocation rule below).
 
-3. **A leasing tool for scarce shared hardware** — [`scripts/dk`](scripts/dk). Any workspace/agent
-   that needs the physical resource claims it first, uses the *exact* serial/id it got back, and
-   releases it when done. This turns "two agents fighting over one board" into "the second agent
-   waits or asks," which is a much better failure mode. See "Setup" below for adapting it to your
-   own hardware.
+3. **A static allocation table for scarce shared hardware** — [`scripts/dk`](scripts/dk). Each
+   physical resource (keyed by, e.g., a J-Link serial) is assigned to a named *owner* — a
+   workspace/agent, or `debug` for your own interactive use — in a small hand-editable config
+   file. Before touching the hardware, a workspace/agent resolves its own owner name to the exact
+   id it's allowed to use, so two workspaces never accidentally grab the same physical board. This
+   turns "two agents fighting over one board" into "the second agent waits or asks," which is a
+   much better failure mode. See "Setup" below for adapting it to your own hardware.
 
 4. **Shared memory across workspaces**, via a symlink. Claude Code's own memory files live under
    `~/.claude/projects/<hash-of-the-workspace-path>/memory/` — one store per distinct working
@@ -81,13 +83,19 @@ hardware.
    that genuinely apply everywhere; project-specific detail belongs in each workspace's own
    `CLAUDE.md` instead.
 
-3. **Install the leasing tool.** Copy [`scripts/dk`](scripts/dk) somewhere on `PATH` (e.g.
-   `~/.local/bin/dk`, `chmod +x`), and edit the seeded pool near the top of the script
-   (`printf '%s\n' 1051875858 1051890455 > "$POOL"`) to list your own resource ids. The script
-   identifies "which workspace am I" by walking up from `$PWD` looking for a `.west` directory —
-   if your repos aren't west workspaces, change `ws_root()`'s marker to `.git` (or whatever
-   identifies your workspace root) so a lease binds to the right directory. See the script's own
-   header comment for how the lease state works.
+3. **Install the allocation tool.** Copy [`scripts/dk`](scripts/dk) somewhere on `PATH` (e.g.
+   `~/.local/bin/dk`, `chmod +x`; it's a standalone Python 3 script, stdlib only — no bash-isms to
+   adapt). It reads/writes a TOML config, default `~/.config/nrf-dk/boards.toml` (override with
+   `NRF_DK_CONFIG`), where each `[[board]]` maps a serial to an owner string. Seed it once per
+   resource:
+   ```
+   dk allocate <serial-or-substring> agent:0   # -> workspace ~/r/0
+   dk allocate <serial-or-substring> agent:1   # -> workspace ~/r/1
+   dk allocate <serial-or-substring> debug     # -> your own interactive use
+   ```
+   `dk list` shows connected devices via `nrfutil device list --json`; if your hardware isn't a
+   Nordic DK, swap `list_connected()` in the script for whatever inventory command your own
+   hardware exposes.
 
 4. **Merge and symlink memory.** Do this in two steps, in order — don't skip straight to
    symlinking if the workspaces already have their own accumulated memory, or you'll silently lose
@@ -112,12 +120,15 @@ hardware.
 - Start each agent (or your own interactive session) from one specific `~/r/N`, and let it stay
   there for the session — don't `cd` between workspaces mid-session (see "Things that don't work
   the way you'd expect" below for why).
-- Before touching the shared hardware: `dk claim` (or `dk claim <specific-id>` if you need a
-  particular one), then always pass the exact id/serial you got back to whatever command actually
-  drives the hardware. `dk release` as soon as verification is done — including on failure. Don't
-  hold a lease "just in case" between tasks; it's shared, and another workspace may be waiting.
-- `dk status` any time you want to see the whole pool: what's leased, to whom, and what's actually
-  plugged in / reachable right now.
+- Before touching the shared hardware: `dk resolve <owner>` to get the exact id allocated to this
+  workspace/agent, and pass *that exact id* to whatever command actually drives the hardware.
+  Never let a tool auto-pick "the first" device when more than one is connected.
+- `dk list` any time you want to see the whole picture: what's allocated to whom, and what's
+  actually connected right now. `dk who <serial>` looks up an allocation the other direction;
+  `dk allocate`/`dk free` change one.
+- Allocation here is **static**, not a per-task lease: an owner keeps "their" board until someone
+  explicitly re-`allocate`s it elsewhere. If the board you need is allocated to someone else, wait
+  or ask — don't reassign another workspace's hardware out from under it.
 
 ## Things that don't work the way you'd expect
 
@@ -132,7 +143,7 @@ hardware.
   file reads/writes. If a future version of your agentic tool moves memory into something other
   than flat files, this specific trick may need revisiting; the *goal* (one shared knowledge store
   across workspaces) still stands regardless of the mechanism.
-- **A leasing tool only helps if everything agrees to use it.** `dk`'s mutual exclusion is
-  advisory — nothing stops a command that ignores the lease and grabs a resource directly. The
-  discipline of "always claim first, always pass the exact id back" has to be a standing
-  instruction (piece #2), not something the tool can enforce by itself.
+- **An allocation table only helps if everything agrees to use it.** `dk`'s config is a
+  hand-editable table, not a lock — nothing stops a command that ignores it and grabs a device
+  directly. The discipline of "always resolve by owner first, always pass the exact id back" has
+  to be a standing instruction (piece #2), not something the tool can enforce by itself.
